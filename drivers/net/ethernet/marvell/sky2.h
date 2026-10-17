@@ -2307,6 +2307,9 @@ struct sky2_hw {
 	dma_addr_t   	     st_dma;
 
 	struct timer_list    watchdog_timer;
+#ifdef CONFIG_X86_PS4
+	struct timer_list    aeolia_poll_timer;
+#endif
 	struct work_struct   restart_work;
 	wait_queue_head_t    msi_wait;
 
