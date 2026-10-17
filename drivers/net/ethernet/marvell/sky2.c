@@ -91,6 +91,22 @@ static int disable_msi = -1;
 module_param(disable_msi, int, 0);
 MODULE_PARM_DESC(disable_msi, "Disable Message Signaled Interrupt (MSI)");
 
+#ifdef CONFIG_X86_PS4
+/* Aeolia (PS4 Fat) experiments, selectable from the kernel command line:
+ *   sky2.aeolia_icr=1   mask/unmask the IRQ through register 0x68 (commit 8fb6ca56c4ac).
+ *                       Off by default: 0x68 is also an Aeolia glue config register
+ *                       (sky2_reset writes 0x63b9c there).
+ *   sky2.aeolia_poll=N  ignore the (storming) MSI and run NAPI from a timer every N ms.
+ */
+static int aeolia_icr;
+module_param(aeolia_icr, int, 0444);
+MODULE_PARM_DESC(aeolia_icr, "PS4 Aeolia: use register 0x68 to mask/unmask the IRQ (0=off)");
+
+static int aeolia_poll;
+module_param(aeolia_poll, int, 0444);
+MODULE_PARM_DESC(aeolia_poll, "PS4 Aeolia: disable the IRQ and poll every N ms (0=off)");
+#endif
+
 static int legacy_pme = 0;
 module_param(legacy_pme, int, 0);
 MODULE_PARM_DESC(legacy_pme, "Legacy power management");
@@ -1715,6 +1731,38 @@ static void sky2_hw_up(struct sky2_port *sky2)
 	sky2_rx_start(sky2);
 }
 
+#ifdef CONFIG_X86_PS4
+static void sky2_aeolia_poll_timer(struct timer_list *t)
+{
+	struct sky2_hw *hw = timer_container_of(hw, t, aeolia_poll_timer);
+
+	if (hw->flags & SKY2_HW_IRQ_SETUP)
+		napi_schedule(&hw->napi);
+	mod_timer(&hw->aeolia_poll_timer,
+		  jiffies + max_t(unsigned long, 1, msecs_to_jiffies(aeolia_poll)));
+}
+
+static void sky2_aeolia_poll_start(struct sky2_hw *hw)
+{
+	if (aeolia_poll <= 0)
+		return;
+	disable_irq(hw->pdev->irq);
+	mod_timer(&hw->aeolia_poll_timer, jiffies + 1);
+	dev_info(&hw->pdev->dev, "aeolia: IRQ disabled, polling every %d ms\n", aeolia_poll);
+}
+
+static void sky2_aeolia_poll_stop(struct sky2_hw *hw)
+{
+	if (aeolia_poll <= 0)
+		return;
+	timer_delete_sync(&hw->aeolia_poll_timer);
+	enable_irq(hw->pdev->irq);
+}
+#else
+static inline void sky2_aeolia_poll_start(struct sky2_hw *hw) { }
+static inline void sky2_aeolia_poll_stop(struct sky2_hw *hw) { }
+#endif
+
 /* Setup device IRQ and enable napi to process */
 static int sky2_setup_irq(struct sky2_hw *hw, const char *name)
 {
@@ -1732,6 +1780,7 @@ static int sky2_setup_irq(struct sky2_hw *hw, const char *name)
 		napi_enable(&hw->napi);
 		sky2_write32(hw, B0_IMSK, Y2_IS_BASE);
 		sky2_read32(hw, B0_IMSK);
+		sky2_aeolia_poll_start(hw);
 	}
 
 	return err;
@@ -2131,6 +2180,7 @@ static int sky2_close(struct net_device *dev)
 		sky2_write32(hw, B0_IMSK, 0);
 		sky2_read32(hw, B0_IMSK);
 
+		sky2_aeolia_poll_stop(hw);
 		napi_disable(&hw->napi);
 		free_irq(hw->pdev->irq, hw);
 		hw->flags &= ~SKY2_HW_IRQ_SETUP;
@@ -3055,7 +3105,8 @@ static int sky2_poll(struct napi_struct *napi, int work_limit)
 	sky2_read32(hw, B0_Y2_SP_LISR);
 #ifdef CONFIG_X86_PS4
 	/* Aeolia: LISR read has no unmas side-effeectt; rearm via ICR */
-	sky2_write32(hw, AEOLIA_SP_ICR,1);
+	if (aeolia_icr)
+		sky2_write32(hw, AEOLIA_SP_ICR, 1);
 #endif
 done:
 
@@ -3069,7 +3120,8 @@ static irqreturn_t sky2_intr(int irq, void *dev_id)
 #ifdef CONFIG_X86_PS4
 	/* Aeolia: mask on entry before any register read to close the
 	 * re-assertion race window. ISRC2 read has no mask side-effect. */
-	sky2_write32(hw, AEOLIA_SP_ICR, 2);
+	if (aeolia_icr)
+		sky2_write32(hw, AEOLIA_SP_ICR, 2);
 #endif
 	/* Reading this masks interrupts as side effect (standard Yukon-2 only) */
 	status = sky2_read32(hw, B0_Y2_SP_ISRC2);
@@ -5094,6 +5146,9 @@ static int sky2_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 	}
 
 	timer_setup(&hw->watchdog_timer, sky2_watchdog, 0);
+#ifdef CONFIG_X86_PS4
+	timer_setup(&hw->aeolia_poll_timer, sky2_aeolia_poll_timer, 0);
+#endif
 	INIT_WORK(&hw->restart_work, sky2_restart);
 
 	pci_set_drvdata(pdev, hw);
@@ -5158,6 +5213,7 @@ static void sky2_remove(struct pci_dev *pdev)
 	sky2_read8(hw, B0_CTST);
 
 	if (hw->ports > 1) {
+		sky2_aeolia_poll_stop(hw);
 		napi_disable(&hw->napi);
 		free_irq(pdev->irq, hw);
 	}
