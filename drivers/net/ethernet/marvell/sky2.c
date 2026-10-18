@@ -2137,6 +2137,13 @@ static void sky2_hw_down(struct sky2_port *sky2)
 	ctrl &= ~(GM_GPCR_TX_ENA | GM_GPCR_RX_ENA);
 	gma_write16(hw, port, GM_GP_CTRL, ctrl);
 
+#ifdef CONFIG_X86_PS4
+	/* Aeolia: resetting the PHY on ifdown leaves RX broken after the next
+	 * ifup (frames arrive with FCS errors, RX OK stays 0). Keep the PHY as
+	 * configured, like the PHY reset already skipped in sky2_reset(). */
+	if (!(hw->pdev->vendor == PCI_VENDOR_ID_SONY &&
+	      hw->pdev->device == PCI_DEVICE_ID_SONY_AEOLIA_GBE))
+#endif
 	sky2_write8(hw, SK_REG(port, GPHY_CTRL), GPC_RST_SET);
 
 	/* Workaround shared GMAC reset */
@@ -2154,9 +2161,15 @@ static void sky2_hw_down(struct sky2_port *sky2)
 
 	sky2_rx_stop(sky2);
 
-	spin_lock_bh(&sky2->phy_lock);
-	sky2_phy_power_down(hw, port);
-	spin_unlock_bh(&sky2->phy_lock);
+#ifdef CONFIG_X86_PS4
+	if (!(hw->pdev->vendor == PCI_VENDOR_ID_SONY &&
+	      hw->pdev->device == PCI_DEVICE_ID_SONY_AEOLIA_GBE))
+#endif
+	{
+		spin_lock_bh(&sky2->phy_lock);
+		sky2_phy_power_down(hw, port);
+		spin_unlock_bh(&sky2->phy_lock);
+	}
 
 	sky2_tx_reset(hw, port);
 
